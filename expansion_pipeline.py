@@ -72,6 +72,38 @@ _SS_FIELDS = "title,authors,year,abstract,externalIds,citationCount,url"
 
 
 # ─────────────────────────────────────────────
+# UTILITÀ DETERMINISTICHE ANTI-RIPETIZIONE
+# ─────────────────────────────────────────────
+
+def _strip_code_fences(text: str) -> str:
+    """
+    Rimuove wrapper ```markdown ... ``` (o ```) dal testo.
+    Alcune sezioni generate dalla pipeline principale vengono avvolte in
+    blocchi di codice Markdown — vanno eliminati prima di passare il
+    contenuto all'LLM per evitare che li riproduca.
+    """
+    # Rimuove apertura: ```markdown\n  oppure ```\n
+    text = re.sub(r'^```(?:markdown)?\s*\n', '', text.strip())
+    # Rimuove chiusura: \n```  alla fine
+    text = re.sub(r'\n```\s*$', '', text.strip())
+    return text.strip()
+
+
+def _strip_leading_heading(text: str) -> str:
+    """
+    Rimuove eventuali righe di heading Markdown (##, ###, ecc.) che l'LLM
+    aggiunge in cima alla risposta, duplicando il titolo già gestito da
+    save_expansion_run con il separatore ## .
+    Continua a rimuovere righe di heading consecutive fino al primo
+    paragrafo di testo.
+    """
+    lines = text.lstrip().split("\n")
+    while lines and re.match(r'^#{1,4}\s+', lines[0].strip()):
+        lines.pop(0)
+    return "\n".join(lines).lstrip()
+
+
+# ─────────────────────────────────────────────
 # STEP 1 — PARSING DELLA SINTESI
 # ─────────────────────────────────────────────
 
@@ -90,7 +122,9 @@ def parse_synthesis(md_path: Path) -> list[dict]:
             continue
         lines = part.split("\n", 1)
         raw_title = lines[0].lstrip("# ").strip()
-        content = lines[1].strip() if len(lines) > 1 else ""
+        raw_content = lines[1].strip() if len(lines) > 1 else ""
+        # Rimuove wrapper ```markdown``` prima di qualsiasi elaborazione
+        content = _strip_code_fences(raw_content)
         # Salta header di metadati (run ID, linea orizzontale, titolo H1)
         if not raw_title or raw_title.startswith("*Run ID"):
             continue
@@ -387,7 +421,11 @@ Il tuo compito:
 5. Non rimuovere o alterare le citazioni esistenti
 6. Restituisci la sezione completa espansa in Markdown
 
-IMPORTANTE: Cita SOLO i paper presenti nella lista "nuovi paper". Non inventare riferimenti."""
+IMPORTANTE:
+- Cita SOLO i paper presenti nella lista "nuovi paper". Non inventare riferimenti.
+- NON inserire il titolo della sezione come intestazione (##, ###) all'inizio della risposta.
+- Inizia DIRETTAMENTE con il testo del primo paragrafo, senza alcuna riga di heading.
+- NON avvolgere la risposta in blocchi di codice (```markdown```)."""
 
 
 def expand_section_content(
@@ -432,7 +470,9 @@ def expand_section_content(
             {"role": "user", "content": prompt},
         ],
     )
-    return response.choices[0].message.content
+    raw = response.choices[0].message.content
+    # Rimozione deterministica di heading iniziali e code fences residui
+    return _strip_leading_heading(_strip_code_fences(raw))
 
 
 # ─────────────────────────────────────────────
@@ -574,9 +614,11 @@ def run_expansion_pipeline(synthesis_path: Path, top_k: int = 5) -> Path:
         # ── Fase 7: self-reflection ──────────────────────────────────────────
         log.info("STEP 7 — Self-reflection...")
         all_papers_for_reflect = top_papers  # include solo i nuovi per la validazione citazioni
-        expanded_final = reflect_on_section(
+        raw_reflection = reflect_on_section(
             client, section["title"], expanded_draft, all_papers_for_reflect
         )
+        # Strip deterministico: reflect_on_section può aggiungere heading iniziali
+        expanded_final = _strip_leading_heading(_strip_code_fences(raw_reflection))
 
         # Aggiorna gli URL già citati per le sezioni successive
         new_urls = {c["url"].lower() for c in extract_citations(expanded_final)}
