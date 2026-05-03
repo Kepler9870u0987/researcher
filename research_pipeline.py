@@ -18,10 +18,12 @@ Dipendenze:
 import math
 import os
 import json
+import re
 import time
 import hashlib
 import logging
 import sqlite3
+import threading
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -75,6 +77,11 @@ CONFIG = {
     "semantic_scholar_api_key": os.environ.get("SEMANTIC_SCHOLAR_API_KEY", ""),
     # OpenAlex: una email attiva il "polite pool" (nessuna registrazione)
     "openalex_email": os.environ.get("OPENALEX_EMAIL", ""),
+
+    # Modalità sintesi
+    "hierarchical_synthesis": True,   # True = outline + sezioni + self-reflection
+    "max_tokens_outline": 1500,        # token per la generazione dell'indice
+    "max_tokens_section": 2500,        # token per la scrittura di ogni sezione
 }
 
 # ─────────────────────────────────────────────
@@ -145,6 +152,8 @@ class Paper(TypedDict):
     doi: str
     citations: int
     subtopic_id: str
+    concepts: list[str]       # keyword accademiche (da OpenAlex)
+    affiliations: list[str]   # istituzioni degli autori (da OpenAlex)
 
 
 # ─────────────────────────────────────────────
@@ -177,15 +186,22 @@ def _http_get(url: str, **kwargs) -> requests.Response:
 # STEP 1 — DECOMPOSIZIONE DEL PENSIERO
 # ─────────────────────────────────────────────
 
-DECOMPOSE_SYSTEM = """Sei un assistente di ricerca scientifica.
-Il tuo compito è analizzare un pensiero grezzo dell'utente e produrre:
-1. Un titolo formalizzato del macro-argomento
-2. Una descrizione sintetica dell'argomento
-3. Una lista di 4-6 sotto-domande di ricerca specifiche e ortogonali tra loro
-4. Per ogni sotto-domanda: 2-3 query di ricerca ottimizzate per database accademici
+DECOMPOSE_SYSTEM = """Sei un assistente di ricerca scientifica esperto nell'analisi di problemi complessi.
 
-Rispondi SOLO con un oggetto JSON valido, nessun testo aggiuntivo, nessun markdown.
-Schema richiesto:
+Usa i tag <analisi> per il tuo ragionamento interno prima di produrre il JSON:
+<analisi>
+Genera 3 approcci alternativi per scomporre il problema:
+- APPROCCIO A: focalizzato sugli aspetti metodologici e tecnici
+- APPROCCIO B: focalizzato sulle applicazioni pratiche e casi d'uso reali
+- APPROCCIO C: focalizzato sui fondamenti teorici e framework concettuali
+Seleziona l'approccio (o la combinazione) più adatta ai database accademici
+(Arxiv, PubMed, Semantic Scholar, OpenAlex).
+</analisi>
+
+Le sotto-domande devono essere MECE (Mutually Exclusive, Collectively Exhaustive):
+nessuna sovrapposizione, copertura completa del macro-argomento.
+
+Dopo il tag </analisi>, scrivi SOLO l'oggetto JSON (nessun altro testo):
 {
   "macro_topic": "stringa",
   "description": "stringa (2-3 frasi)",
@@ -211,13 +227,11 @@ def decompose_thought(client: OpenAI, thought: str) -> dict:
         ],
     )
     raw = response.choices[0].message.content.strip()
-    # rimuove eventuali backtick se il modello li aggiunge
-    if raw.startswith("```"):
-        raw = raw.split("```", 2)[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.rsplit("```", 1)[0]
-    result = json.loads(raw.strip())
+    # Estrae il JSON in modo robusto: ignora scratchpad <analisi>, backtick e testo discorsivo
+    match = re.search(r'\{.*\}', raw, re.DOTALL)
+    if not match:
+        raise ValueError(f"Nessun oggetto JSON trovato nella risposta LLM: {raw[:200]}")
+    result = json.loads(match.group())
     log.info(f"  Macro-argomento: {result['macro_topic']}")
     log.info(f"  Sotto-argomenti: {len(result['subtopics'])}")
     return result
@@ -231,14 +245,16 @@ def _normalize_paper(source: str, data: dict) -> Paper:
     """Schema comune per tutti i paper indipendentemente dalla sorgente."""
     return {
         "source": source,
-        "title": data.get("title", "").strip(),
-        "authors": data.get("authors", []),
+        "title": (data.get("title") or "").strip(),
+        "authors": data.get("authors") or [],
         "year": data.get("year"),
-        "abstract": data.get("abstract", "").strip(),
-        "url": data.get("url", ""),
-        "doi": data.get("doi", ""),
-        "citations": data.get("citations", 0),
-        "subtopic_id": data.get("subtopic_id", ""),
+        "abstract": (data.get("abstract") or "").strip(),
+        "url": data.get("url") or "",
+        "doi": data.get("doi") or "",
+        "citations": data.get("citations") or 0,
+        "subtopic_id": data.get("subtopic_id") or "",
+        "concepts": data.get("concepts") or [],
+        "affiliations": data.get("affiliations") or [],
     }
 
 
@@ -343,6 +359,10 @@ def fetch_pubmed(queries: list[str], subtopic_id: str) -> list[Paper]:
     return results
 
 
+# Serializza le richieste a Semantic Scholar per evitare burst di 429
+_SS_LOCK = threading.Semaphore(1)
+
+
 def fetch_semantic_scholar(queries: list[str], subtopic_id: str) -> list[Paper]:
     conn = _init_cache()
     results = []
@@ -360,30 +380,31 @@ def fetch_semantic_scholar(queries: list[str], subtopic_id: str) -> list[Paper]:
             continue
 
         try:
-            resp = _http_get(base_url, params={
-                "query": query,
-                "limit": CONFIG["max_results_per_source"],
-                "fields": fields,
-            }, headers=headers, timeout=15)
+            with _SS_LOCK:
+                resp = _http_get(base_url, params={
+                    "query": query,
+                    "limit": CONFIG["max_results_per_source"],
+                    "fields": fields,
+                }, headers=headers, timeout=15)
+                time.sleep(1.0)  # rispetta il rate limit (100 req/min senza API key)
             data = resp.json()
             papers = []
             for p in data.get("data", []):
-                doi = p.get("externalIds", {}).get("DOI", "")
+                doi = (p.get("externalIds") or {}).get("DOI", "")
                 papers.append(_normalize_paper("semantic_scholar", {
-                    "title": p.get("title", ""),
-                    "authors": [a.get("name", "") for a in p.get("authors", [])],
+                    "title": p.get("title"),
+                    "authors": [a.get("name", "") for a in (p.get("authors") or [])],
                     "year": p.get("year"),
-                    "abstract": p.get("abstract", ""),
-                    "url": p.get("url", ""),
+                    "abstract": p.get("abstract"),
+                    "url": p.get("url"),
                     "doi": doi,
-                    "citations": p.get("citationCount", 0),
+                    "citations": p.get("citationCount"),
                     "subtopic_id": subtopic_id,
                 }))
             _cache_set(conn, key, json.dumps(papers))
             results.extend(papers)
         except Exception as e:
             log.warning(f"  SemanticScholar error per '{query}': {e}")
-        time.sleep(0.3)
     return results
 
 
@@ -405,7 +426,7 @@ def fetch_openalex(queries: list[str], subtopic_id: str) -> list[Paper]:
                 .search(query)
                 .select(["title", "authorships", "publication_year",
                          "abstract_inverted_index", "doi",
-                         "cited_by_count", "id"])
+                         "cited_by_count", "id", "concepts"])
                 .get(per_page=CONFIG["max_results_per_source"])
             )
             papers = []
@@ -425,6 +446,17 @@ def fetch_openalex(queries: list[str], subtopic_id: str) -> list[Paper]:
                 ]
                 doi = w.get("doi", "") or ""
                 url = doi if doi.startswith("http") else (f"https://doi.org/{doi}" if doi else w.get("id", ""))
+                concepts = [
+                    c.get("display_name", "")
+                    for c in (w.get("concepts") or [])[:5]
+                    if c.get("display_name")
+                ]
+                inst_set: list[str] = []
+                for a in w.get("authorships", []):
+                    for inst in a.get("institutions", []):
+                        name = inst.get("display_name", "")
+                        if name and name not in inst_set:
+                            inst_set.append(name)
                 papers.append(_normalize_paper("openalex", {
                     "title": w.get("title", ""),
                     "authors": authors,
@@ -434,6 +466,8 @@ def fetch_openalex(queries: list[str], subtopic_id: str) -> list[Paper]:
                     "doi": doi,
                     "citations": w.get("cited_by_count", 0),
                     "subtopic_id": subtopic_id,
+                    "concepts": concepts,
+                    "affiliations": inst_set,
                 }))
             _cache_set(conn, key, json.dumps(papers))
             results.extend(papers)
@@ -571,6 +605,8 @@ def build_synthesis_prompt(decomposed: dict, top_papers: list[Paper]) -> str:
             "url": p["url"],
             "citations": p["citations"],
             "subtopic_id": p["subtopic_id"],
+            "concepts": p.get("concepts", [])[:5],
+            "affiliations": p.get("affiliations", [])[:3],
         }
         for i, p in enumerate(top_papers)
     ], ensure_ascii=False, indent=2)
@@ -615,10 +651,191 @@ def synthesize(client: OpenAI, decomposed: dict, papers: list[Paper]) -> str:
 
 
 # ─────────────────────────────────────────────
+# STEP 4b — SINTESI GERARCHICA
+# ─────────────────────────────────────────────
+
+OUTLINE_SYSTEM = """Sei un ricercatore accademico senior specializzato nell'organizzazione di survey scientifiche.
+Dato un macro-argomento, le sue sotto-domande e una lista di paper, progetta la struttura ottimale
+per un documento accademico con 5-7 sezioni tematiche.
+
+Assegna a ogni sezione i paper più rilevanti usando il campo "id" dei paper.
+I paper possono apparire in più sezioni se rilevanti per entrambe.
+
+Rispondi SOLO con l'oggetto JSON (nessun testo aggiuntivo):
+{
+  "sections": [
+    {
+      "id": "SEC1",
+      "title": "Titolo della sezione",
+      "focus": "Breve descrizione del focus (1 frase)",
+      "paper_ids": [1, 3, 7]
+    }
+  ]
+}"""
+
+SECTION_SYSTEM = """Sei un ricercatore accademico senior. Scrivi una sezione completa di una survey scientifica.
+La sezione deve:
+- Essere di 800-1000 parole
+- Ogni claim deve essere supportato da una citazione nel formato [Autore et al., Anno](URL)
+- Confrontare e mettere in dialogo le fonti, non limitarsi a elencarle
+- Usare un tono accademico formale e preciso
+- Citare SOLO i paper forniti, senza inventare riferimenti
+- Concludere con una sintesi critica della sezione"""
+
+REFLECT_SYSTEM = """Sei un revisore accademico critico. Analizza la bozza di una sezione scientifica e migliora:
+1. Il rigore nel confronto tra le fonti (sono effettivamente messe in dialogo?)
+2. La correttezza delle citazioni (ogni citazione esiste nella lista paper fornita?)
+3. Il tono accademico (evita generalizzazioni, mantieni precisione scientifica)
+4. La chiarezza della struttura argomentativa
+
+Restituisci la sezione migliorata in Markdown, mantenendo approssimativamente la stessa lunghezza."""
+
+
+def generate_outline(client: OpenAI, decomposed: dict, papers: list) -> dict:
+    log.info("  Generazione indice strutturato (outline)...")
+    papers_summary = json.dumps([
+        {
+            "id": p["_outline_id"],
+            "title": p["title"],
+            "year": p["year"],
+            "subtopic_id": p["subtopic_id"],
+            "concepts": p.get("concepts", [])[:3],
+        }
+        for p in papers
+    ], ensure_ascii=False, indent=2)
+
+    prompt = (
+        f"MACRO-ARGOMENTO: {decomposed['macro_topic']}\n"
+        f"DESCRIZIONE: {decomposed['description']}\n\n"
+        f"SOTTO-DOMANDE:\n{json.dumps(decomposed['subtopics'], ensure_ascii=False, indent=2)}\n\n"
+        f"PAPER DISPONIBILI:\n{papers_summary}\n\n"
+        "Progetta la struttura del documento accademico."
+    )
+    response = client.chat.completions.create(
+        model=CONFIG["model"],
+        temperature=CONFIG["temperature"],
+        max_tokens=CONFIG.get("max_tokens_outline", 1500),
+        messages=[
+            {"role": "system", "content": OUTLINE_SYSTEM},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    raw = response.choices[0].message.content.strip()
+    match = re.search(r'\{.*\}', raw, re.DOTALL)
+    if not match:
+        raise ValueError(f"Nessun JSON trovato nella risposta outline: {raw[:200]}")
+    outline = json.loads(match.group())
+    log.info(f"  Indice generato: {len(outline['sections'])} sezioni")
+    return outline
+
+
+def write_section(client: OpenAI, section: dict, papers: list, macro_topic: str) -> str:
+    log.info(f"  Scrittura sezione: '{section['title']}'")
+    papers_block = json.dumps([
+        {
+            "id": p["_outline_id"],
+            "title": p["title"],
+            "authors": p["authors"][:3],
+            "year": p["year"],
+            "abstract": p["abstract"][:600],
+            "url": p["url"],
+            "citations": p["citations"],
+            "concepts": p.get("concepts", [])[:5],
+            "affiliations": p.get("affiliations", [])[:3],
+        }
+        for p in papers
+    ], ensure_ascii=False, indent=2)
+
+    prompt = (
+        f"MACRO-ARGOMENTO: {macro_topic}\n"
+        f"SEZIONE: {section['title']}\n"
+        f"FOCUS: {section['focus']}\n\n"
+        f"PAPER ASSEGNATI A QUESTA SEZIONE:\n{papers_block}\n\n"
+        "Scrivi la sezione completa."
+    )
+    response = client.chat.completions.create(
+        model=CONFIG["model"],
+        temperature=CONFIG["temperature"],
+        max_tokens=CONFIG.get("max_tokens_section", 2500),
+        messages=[
+            {"role": "system", "content": SECTION_SYSTEM},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return response.choices[0].message.content
+
+
+def reflect_on_section(client: OpenAI, section_title: str, draft: str, papers: list) -> str:
+    log.info(f"  Self-reflection su: '{section_title}'")
+    citations_list = "\n".join(
+        f"- [{(p['authors'][0].split()[-1] if p['authors'] else 'N.A.')} et al., {p['year']}]({p['url']})"
+        for p in papers
+    )
+    prompt = (
+        f"SEZIONE: {section_title}\n\n"
+        f"CITAZIONI VALIDE PER QUESTA SEZIONE:\n{citations_list}\n\n"
+        f"BOZZA DA REVISIONARE:\n{draft}\n\n"
+        "Revisiona e migliora la sezione."
+    )
+    response = client.chat.completions.create(
+        model=CONFIG["model"],
+        temperature=CONFIG["temperature"],
+        max_tokens=CONFIG.get("max_tokens_section", 2500),
+        messages=[
+            {"role": "system", "content": REFLECT_SYSTEM},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return response.choices[0].message.content
+
+
+def synthesize_hierarchical(client: OpenAI, decomposed: dict, papers: list[Paper]) -> tuple[dict, str]:
+    """Sintesi gerarchica: outline → scrittura per sezione → self-reflection → merge."""
+    log.info("STEP 4 — Sintesi gerarchica...")
+
+    # Bilancia i paper per sotto-argomento (come synthesize originale)
+    top_per_subtopic: dict[str, list] = {}
+    for p in papers:
+        sid = p.get("subtopic_id", "unknown")
+        top_per_subtopic.setdefault(sid, [])
+        if len(top_per_subtopic[sid]) < 5:
+            top_per_subtopic[sid].append(p)
+    top_papers = [p for group in top_per_subtopic.values() for p in group]
+
+    # Aggiunge un ID progressivo per il mapping dell'outline (campo temporaneo)
+    indexed: list[dict] = []
+    for i, p in enumerate(top_papers):
+        p_copy = dict(p)
+        p_copy["_outline_id"] = i + 1
+        indexed.append(p_copy)
+    log.info(f"  Paper usati: {len(indexed)}")
+
+    # Step 4a: genera l'indice strutturato
+    outline = generate_outline(client, decomposed, indexed)
+
+    # Step 4b + 4c: scrivi e rifletti su ogni sezione
+    paper_by_id = {p["_outline_id"]: p for p in indexed}
+    section_drafts: list[tuple[str, str]] = []
+    for section in outline["sections"]:
+        assigned = [paper_by_id[pid] for pid in section["paper_ids"] if pid in paper_by_id]
+        if not assigned:
+            log.warning(f"  Nessun paper assegnato a '{section['title']}', sezione saltata.")
+            continue
+        draft = write_section(client, section, assigned, decomposed["macro_topic"])
+        revised = reflect_on_section(client, section["title"], draft, assigned)
+        section_drafts.append((section["title"], revised))
+
+    # Step 4d: merge finale in Markdown
+    parts = [f"## {title}\n\n{content}" for title, content in section_drafts]
+    full_synthesis = "\n\n---\n\n".join(parts)
+    return outline, full_synthesis
+
+
+# ─────────────────────────────────────────────
 # STEP 5 — SALVATAGGIO RUN
 # ─────────────────────────────────────────────
 
-def save_run(thought: str, decomposed: dict, papers: list[Paper], synthesis: str) -> Path:
+def save_run(thought: str, decomposed: dict, papers: list[Paper], synthesis: str, outline: Optional[dict] = None) -> Path:
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = Path(CONFIG["output_dir"]) / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -639,6 +856,11 @@ def save_run(thought: str, decomposed: dict, papers: list[Paper], synthesis: str
     # Tutti i paper recuperati
     with open(run_dir / "papers_all.json", "w", encoding="utf-8") as f:
         json.dump(papers, f, ensure_ascii=False, indent=2)
+
+    # Outline strutturato (solo in modalità sintesi gerarchica)
+    if outline is not None:
+        with open(run_dir / "outline.json", "w", encoding="utf-8") as f:
+            json.dump(outline, f, ensure_ascii=False, indent=2)
 
     # Output finale Markdown
     md_path = run_dir / "synthesis.md"
@@ -709,10 +931,14 @@ def run_pipeline(thought: str) -> Path:
     scored_papers = score_papers(all_papers, decomposed["macro_topic"])
 
     # Step 4: sintesi
-    synthesis = synthesize(client, decomposed, scored_papers)
+    outline: Optional[dict] = None
+    if CONFIG.get("hierarchical_synthesis", False):
+        outline, synthesis = synthesize_hierarchical(client, decomposed, scored_papers)
+    else:
+        synthesis = synthesize(client, decomposed, scored_papers)
 
     # Step 5: salvataggio
-    output_path = save_run(thought, decomposed, scored_papers, synthesis)
+    output_path = save_run(thought, decomposed, scored_papers, synthesis, outline=outline)
 
     log.info("=" * 60)
     log.info(f"PIPELINE COMPLETATA — Output: {output_path}")
