@@ -1,0 +1,64 @@
+{
+  "sections": [
+    {
+      "id": "SEC1",
+      "title": "Tecnologie e metodologie per l'integrazione di API web e agenti AI nei sistemi di lead generation",
+      "focus": "Esplorazione delle principali tecnologie e metodologie per integrare API web e agenti AI nei sistemi di lead generation.",
+      "paper_ids": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ]
+    },
+    {
+      "id": "SEC2",
+      "title": "Framework teorici per la valutazione della presenza digitale e della brand identity",
+      "focus": "Analisi dei framework teorici e delle metodologie per valutare la presenza digitale e la brand identity di un'azienda.",
+      "paper_ids": [
+        16,
+        17,
+        18,
+        19,
+        20
+      ]
+    },
+    {
+      "id": "SEC3",
+      "title": "Identificazione dei gap nella presenza online delle PMI tramite strumenti basati su AI e API",
+      "focus": "Metodologie e strumenti per identificare i gap nella presenza online delle PMI utilizzando AI e API.",
+      "paper_ids": [
+        6,
+        7,
+        8,
+        9,
+        10
+      ]
+    },
+    {
+      "id": "SEC4",
+      "title": "Best practice per l'implementazione di sistemi di lead generation per PMI",
+      "focus": "Linee guida e best practice per implementare sistemi di lead generation per PMI utilizzando API web e agenti AI.",
+      "paper_ids": [
+        11,
+        12,
+        13,
+        14,
+        15
+      ]
+    },
+    {
+      "id": "SEC5",
+      "title": "Metriche e KPI per misurare l'efficacia dei sistemi di lead generation basati su API e AI",
+      "focus": "Identificazione delle metriche e dei KPI per valutare il successo dei sistemi di lead generation basati su API e AI.",
+      "paper_ids": [
+        21,
+        22,
+        23,
+        24,
+        25
+      ]
+    }
+  ]
+}
