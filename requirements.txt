@@ -1,0 +1,10 @@
+# research_pipeline — dipendenze Python
+# Installa con: pip install -r requirements.txt
+
+openai>=1.30.0
+arxiv>=2.1.0
+biopython>=1.83
+requests>=2.31.0
+pyalex>=0.13
+sentence-transformers>=2.7.0
+tenacity>=8.3.0
