@@ -76,21 +76,23 @@ class PdfRenderer:
         page.set_default_navigation_timeout(self._config.nav_timeout_ms)
         return page
 
-    async def navigate(self, page: Page, url: str) -> bool:
-        """Navigate to URL with retry and fallback wait strategy. Returns True on success."""
+    async def navigate(self, page: Page, url: str) -> int | None:
+        """Navigate to URL with retry and fallback wait strategy.
+        Returns the HTTP status code on success, or None if unavailable."""
         strategies = [self._config.wait_until]
         if self._config.wait_until == "networkidle":
             strategies.append("domcontentloaded")
 
+        last_response = None
         for strategy in strategies:
             try:
-                await page.goto(url, wait_until=strategy)
-                return True
+                last_response = await page.goto(url, wait_until=strategy)
+                return last_response.status if last_response else None
             except Exception:
                 if strategy == strategies[-1]:
                     raise
                 continue
-        return False
+        return None
 
     async def render_pdf(self, page: Page, url: str, out_path: Path) -> int:
         """Render the current page to PDF. Returns file size in bytes."""

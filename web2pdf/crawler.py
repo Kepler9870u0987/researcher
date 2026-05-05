@@ -144,13 +144,34 @@ class Crawler:
 
                 # Navigate
                 try:
-                    await renderer.navigate(page, url)
+                    status = await renderer.navigate(page, url)
                 except Exception as e:
                     self.tracer.log("nav_error", url=url, depth=depth, error=str(e)[:200])
                     self.tracer.advance(error=True)
                     self._errors += 1
                     queue.task_done()
                     continue
+
+                # Skip on HTTP 4xx/5xx if configured
+                if self.cfg.skip_404 and status is not None and status >= 400:
+                    self.tracer.log("skipped_http_error", url=url, status=status)
+                    self.tracer.advance(error=False)
+                    queue.task_done()
+                    continue
+
+                # Skip on "not found" content patterns (soft 404)
+                if self.cfg.skip_404 and self.cfg.not_found_patterns:
+                    try:
+                        html_check = await renderer.get_html(page)
+                        if any(pat in html_check for pat in self.cfg.not_found_patterns):
+                            self.tracer.log(
+                                "skipped_soft_404", url=url, status=status,
+                            )
+                            self.tracer.advance(error=False)
+                            queue.task_done()
+                            continue
+                    except Exception:
+                        pass
 
                 # Render PDF
                 if self.cfg.mirror_paths:
@@ -170,6 +191,7 @@ class Crawler:
                         "depth": depth,
                         "title": title,
                         "status": "ok",
+                        "http_status": status,
                         "bytes": size,
                         "parent_url": parent,
                         "fetched_at": datetime.now().isoformat(timespec="seconds"),

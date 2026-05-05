@@ -29,6 +29,14 @@ class Config(BaseModel):
     mirror_paths: bool = False
     print_css: Optional[str] = None
     dry_run: bool = False
+    skip_404: bool = True
+    not_found_patterns: list[str] = Field(
+        default_factory=lambda: [
+            "Page Not Found - 404",
+            "404 Not Found",
+            "Page not found",
+        ]
+    )
 
     @field_validator("start_url")
     @classmethod

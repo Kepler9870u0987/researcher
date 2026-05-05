@@ -150,6 +150,81 @@ def cmd_merge(args: argparse.Namespace) -> int:
     return 0
 
 
+DEFAULT_404_PATTERNS = [
+    "Page Not Found - 404",
+    "404 Not Found",
+    "Page not found",
+]
+
+
+def cmd_clean(args: argparse.Namespace) -> int:
+    """Scan PDFs in an existing run and delete those that contain 404 markers."""
+    run_dir = Path(args.run_dir)
+    index_path = run_dir / "index.json"
+    pdf_dir = run_dir / "pdfs"
+    if not index_path.exists() or not pdf_dir.exists():
+        print(f"Error: {run_dir} is not a valid run directory.", file=sys.stderr)
+        return 1
+
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        print("Error: pypdf is required. Install with: pip install pypdf", file=sys.stderr)
+        return 1
+
+    patterns = args.pattern or DEFAULT_404_PATTERNS
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+
+    removed: list[str] = []
+    kept: dict[str, dict] = {}
+
+    for url, info in index.items():
+        pdf_path = pdf_dir / info["file"]
+        if not pdf_path.exists():
+            continue
+
+        is_404 = False
+        try:
+            reader = PdfReader(str(pdf_path))
+            # Check first 3 pages of text for the 404 marker
+            text_chunks = []
+            for p in reader.pages[:3]:
+                try:
+                    text_chunks.append(p.extract_text() or "")
+                except Exception:
+                    pass
+            full_text = "\n".join(text_chunks)
+            if any(pat in full_text for pat in patterns):
+                is_404 = True
+        except Exception as e:
+            print(f"Warning: could not read {pdf_path.name}: {e}", file=sys.stderr)
+
+        if is_404:
+            if args.dry_run:
+                print(f"[would delete] {pdf_path.name}  ({url})")
+            else:
+                pdf_path.unlink()
+                print(f"[deleted]      {pdf_path.name}  ({url})")
+            removed.append(url)
+        else:
+            kept[url] = info
+
+    # Persist updated index unless dry-run
+    if not args.dry_run and removed:
+        index_path.write_text(
+            json.dumps(kept, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        # Regenerate sitemap
+        args.run_dir = str(run_dir)
+        cmd_replay(args)
+
+    print(
+        f"\n{'[dry-run] ' if args.dry_run else ''}"
+        f"404 PDFs found: {len(removed)} | kept: {len(kept)} | total: {len(index)}"
+    )
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="web2pdf",
@@ -169,6 +244,19 @@ def main() -> int:
     merge_p = sub.add_parser("merge", help="Merge PDFs from existing run into one file")
     merge_p.add_argument("run_dir", help="Path to existing run directory")
 
+    # clean
+    clean_p = sub.add_parser("clean", help="Delete PDFs containing 404 markers")
+    clean_p.add_argument("run_dir", help="Path to existing run directory")
+    clean_p.add_argument(
+        "--pattern",
+        action="append",
+        default=[],
+        help=f"Text pattern to match (repeatable). Defaults: {DEFAULT_404_PATTERNS}",
+    )
+    clean_p.add_argument(
+        "--dry-run", action="store_true", help="List PDFs that would be deleted without deleting"
+    )
+
     args = parser.parse_args()
 
     # Default to crawl if URL provided without sub-command
@@ -181,7 +269,7 @@ def main() -> int:
             return 1
         return cmd_crawl(args)
 
-    dispatch = {"crawl": cmd_crawl, "replay": cmd_replay, "merge": cmd_merge}
+    dispatch = {"crawl": cmd_crawl, "replay": cmd_replay, "merge": cmd_merge, "clean": cmd_clean}
     return dispatch[args.command](args)
 
 
