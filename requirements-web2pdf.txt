@@ -1,0 +1,15 @@
+# Dipendenze per web2pdf pipeline
+# Installa con:
+#   pip install -r requirements-web2pdf.txt
+#   python -m playwright install chromium
+
+playwright>=1.43.0
+beautifulsoup4>=4.12.0
+pydantic>=2.5.0
+rich>=13.7.0
+tenacity>=8.3.0
+tldextract>=5.1.0
+
+# Opzionali (merge PDF, config YAML)
+# pypdf>=4.0.0
+# pyyaml>=6.0.0

@@ -36,39 +36,58 @@ from openai import OpenAI
 # ─── Riutilizzo integrale dell'infrastruttura della pipeline principale ───────
 from research_pipeline import (
     CONFIG,
+    LLM_STATS,
     Paper,
-    _EMBEDDING_MODEL,       # noqa: F401  (importato per triggerare singleton)
+    _EMBEDDING_MODEL,           # noqa: F401  (importato per triggerare singleton)
+    _SS_FIELDS,
     _SS_LOCK,
+    _build_ss_paper_lookup_id,
     _cache_get,
     _cache_key,
     _cache_set,
     _http_get,
     _init_cache,
     _normalize_paper,
+    _ss_paper_to_normalized,
     deduplicate,
     fetch_arxiv,
     fetch_openalex,
     fetch_pubmed,
     fetch_semantic_scholar,
     filter_by_year,
+    get_ss_recommendations,
+    llm_chat,
+    mmr_select,
     reflect_on_section,
+    resolve_paper_ss,
     score_papers,
 )
 
 log = logging.getLogger(__name__)
 
-# ─── Configurazione espansione (sovrascrive solo i valori rilevanti) ──────────
+# ─── Configurazione espansione ────────────────────────────────────────────────
 EXPANSION_CONFIG = {
-    # Paper nuovi da aggiungere per sezione (top-K dopo lo scoring)
     "top_k_per_section": 5,
-    # Risultati massimi dall'API SS Recommendations
     "ss_recommendations_limit": 10,
-    # Token LLM per l'espansione di ogni sezione
     "max_tokens_expand": 3000,
+    # Self-reflection: raddoppia le chiamate LLM, default disattivato
+    "enable_reflection": False,
+    # Max citazioni per sezione da cui partire (riduce le chiamate API)
+    "max_citations_per_section": 3,
+    # Max titoli per la ricerca multi-source (se threshold non soddisfatta)
+    "max_titles_for_search": 3,
+    # Soglia: se SS Recommendations producono >= N candidati, salta multi-source
+    "skip_multisource_threshold": 15,
+    # Caratteri abstract per ogni paper inviato all'LLM
+    "abstract_chars_expand": 300,
+    # MMR per la selezione dei paper per sezione
+    "enable_mmr": True,
+    "mmr_lambda": 0.6,
+    # Fetch delle REFERENZE (oltre alle raccomandazioni) via SS
+    "enable_references_fetch": True,
+    # Modalità diff: chiede all'LLM solo i nuovi paragrafi (riduce ~50% token output)
+    "diff_mode": False,
 }
-
-# Campi richiesti sia a SS Graph che a SS Recommendations
-_SS_FIELDS = "title,authors,year,abstract,externalIds,citationCount,url"
 
 
 # ─────────────────────────────────────────────
@@ -163,126 +182,23 @@ def collect_all_cited_urls(sections: list[dict]) -> set[str]:
 
 
 # ─────────────────────────────────────────────
-# STEP 2 — RISOLUZIONE CITAZIONI VIA SEMANTIC SCHOLAR
+# STEP 2 — FETCH REFERENZE VIA SS
 # ─────────────────────────────────────────────
 
-def _extract_ss_id_from_url(url: str) -> Optional[str]:
+def fetch_ss_references_for_paper(ss_paper_id: str, subtopic_id: str = "expansion") -> list[Paper]:
     """
-    Estrae l'ID Semantic Scholar da un URL semanticscholar.org.
-    Formato: https://www.semanticscholar.org/paper/{Title}/{paperId}
-              oppure  https://api.semanticscholar.org/.../{paperId}
-    """
-    m = re.search(r'semanticscholar\.org/paper/[^/]+/([a-f0-9]{40})', url)
-    if m:
-        return m.group(1)
-    # Formato con solo l'ID hash finale
-    m = re.search(r'semanticscholar\.org/paper/([a-f0-9]{40})', url)
-    if m:
-        return m.group(1)
-    # ID alfanumerico corto (SS internal IDs)
-    m = re.search(r'semanticscholar\.org/paper/[^/]+/([A-Za-z0-9]{6,})', url)
-    if m:
-        return m.group(1)
-    return None
-
-
-def _build_ss_paper_lookup_id(url: str) -> Optional[str]:
-    """
-    Costruisce l'identificatore per l'API SS Graph a partire da un URL.
-    Restituisce una stringa nel formato accettato da /paper/{id}:
-      - DOI:{doi}
-      - ARXIV:{arxivId}
-      - {ssId} (ID nativo SS)
-    """
-    url_lower = url.lower()
-
-    # DOI
-    if "doi.org/" in url_lower:
-        doi = re.sub(r'^https?://doi\.org/', '', url, flags=re.IGNORECASE).strip()
-        if doi:
-            return f"DOI:{doi}"
-
-    # arXiv
-    arxiv_m = re.search(r'arxiv\.org/(?:abs|pdf)/([0-9]+\.[0-9v]+)', url, re.IGNORECASE)
-    if arxiv_m:
-        return f"ARXIV:{arxiv_m.group(1)}"
-
-    # Semantic Scholar URL
-    ss_id = _extract_ss_id_from_url(url)
-    if ss_id:
-        return ss_id
-
-    # PubMed — non è direttamente supportato come lookup SS; restituisce None
-    return None
-
-
-def resolve_paper_ss(url: str) -> Optional[dict]:
-    """
-    Risolve un URL citato → metadati paper via Semantic Scholar Graph API.
-    Usa la cache SQLite per evitare chiamate ripetute.
-    Restituisce None se non riesce a risolvere.
-    """
-    lookup_id = _build_ss_paper_lookup_id(url)
-    if not lookup_id:
-        return None
-
-    conn = _init_cache()
-    cache_k = _cache_key("ss_resolve", lookup_id)
-    cached = _cache_get(conn, cache_k)
-    if cached:
-        data = json.loads(cached)
-        return data if data else None  # None serializzato come {}
-
-    ss_url = f"https://api.semanticscholar.org/graph/v1/paper/{lookup_id}"
-    headers = {}
-    if CONFIG.get("semantic_scholar_api_key"):
-        headers["x-api-key"] = CONFIG["semantic_scholar_api_key"]
-
-    try:
-        with _SS_LOCK:
-            resp = _http_get(ss_url, params={"fields": _SS_FIELDS}, headers=headers, timeout=15)
-            time.sleep(1.0)
-        data = resp.json()
-        _cache_set(conn, cache_k, json.dumps(data))
-        return data
-    except Exception as e:
-        log.debug(f"  SS resolve fallito per '{lookup_id}': {e}")
-        _cache_set(conn, cache_k, json.dumps({}))  # Cachea il fallimento
-        return None
-
-
-def _ss_paper_to_normalized(ss_data: dict, subtopic_id: str = "expansion") -> Paper:
-    """Converte un paper SS Graph response al formato Paper normalizzato."""
-    doi = (ss_data.get("externalIds") or {}).get("DOI", "")
-    authors = [a.get("name", "") for a in (ss_data.get("authors") or [])]
-    return _normalize_paper("semantic_scholar", {
-        "title": ss_data.get("title", ""),
-        "authors": authors,
-        "year": ss_data.get("year"),
-        "abstract": ss_data.get("abstract", "") or "",
-        "url": ss_data.get("url", "") or f"https://doi.org/{doi}" if doi else "",
-        "doi": doi,
-        "citations": ss_data.get("citationCount", 0) or 0,
-        "subtopic_id": subtopic_id,
-    })
-
-
-# ─────────────────────────────────────────────
-# STEP 3 — SS RECOMMENDATIONS
-# ─────────────────────────────────────────────
-
-def get_ss_recommendations(ss_paper_id: str) -> list[Paper]:
-    """
-    Recupera paper correlati tramite SS Recommendations API.
-    GET /recommendations/v1/papers/forpaper/{paperId}
+    Recupera la BIBLIOGRAFIA di un paper via SS /paper/{id}/references.
+    I paper referenziati dall'autore originale sono semanticamente più vicini
+    al tema della sezione rispetto alle semplici "raccomandazioni algoritmiche".
     """
     conn = _init_cache()
-    cache_k = _cache_key("ss_recommendations", ss_paper_id)
-    cached = _cache_get(conn, cache_k)
+    cache_k = _cache_key("ss_references", ss_paper_id)
+    cached = _cache_get(conn, cache_k, ttl_days=60)
     if cached:
         return json.loads(cached)
 
-    rec_url = f"https://api.semanticscholar.org/recommendations/v1/papers/forpaper/{ss_paper_id}"
+    ref_url = f"https://api.semanticscholar.org/graph/v1/paper/{ss_paper_id}/references"
+    fields = "title,authors,year,abstract,externalIds,citationCount,url"
     headers = {}
     if CONFIG.get("semantic_scholar_api_key"):
         headers["x-api-key"] = CONFIG["semantic_scholar_api_key"]
@@ -290,28 +206,97 @@ def get_ss_recommendations(ss_paper_id: str) -> list[Paper]:
     try:
         with _SS_LOCK:
             resp = _http_get(
-                rec_url,
-                params={"fields": _SS_FIELDS, "limit": EXPANSION_CONFIG["ss_recommendations_limit"]},
+                ref_url,
+                params={"fields": fields, "limit": 20},
                 headers=headers,
                 timeout=15,
             )
             time.sleep(1.0)
-        data = resp.json()
         papers = []
-        for p in data.get("recommendedPapers", []):
-            if p.get("title"):
-                papers.append(_ss_paper_to_normalized(p, subtopic_id="expansion"))
+        for item in resp.json().get("data", []):
+            ref = item.get("citedPaper", {})
+            if ref.get("title"):
+                papers.append(_ss_paper_to_normalized(ref, subtopic_id))
         _cache_set(conn, cache_k, json.dumps(papers))
-        log.debug(f"  SS Recommendations per {ss_paper_id[:12]}...: {len(papers)} paper")
+        log.debug(f"  SS References per {ss_paper_id[:12]}...: {len(papers)} paper")
         return papers
     except Exception as e:
-        log.debug(f"  SS Recommendations fallita per {ss_paper_id}: {e}")
+        log.debug(f"  SS References fallita per {ss_paper_id}: {e}")
         _cache_set(conn, cache_k, json.dumps([]))
         return []
 
 
+def resolve_papers_ss_batch(urls: list[str], subtopic_id: str = "expansion") -> list[Paper]:
+    """
+    Risolve più URL contemporaneamente via SS /paper/batch (fino a 500 ID per call).
+    Molto più efficiente di N chiamate seriali; riduce drasticamente il rischio 429.
+    """
+    # Costruisce gli SS lookup IDs
+    id_to_url: dict[str, str] = {}
+    for url in urls:
+        lid = _build_ss_paper_lookup_id(url)
+        if lid:
+            id_to_url[lid] = url
+
+    if not id_to_url:
+        return []
+
+    # Controlla cache per ogni ID
+    conn = _init_cache()
+    results: list[Paper] = []
+    ids_to_fetch: list[str] = []
+    for lid in id_to_url:
+        cache_k = _cache_key("ss_resolve", lid)
+        cached = _cache_get(conn, cache_k, ttl_days=0)
+        if cached:
+            data = json.loads(cached)
+            if data and data.get("title"):
+                results.append(_ss_paper_to_normalized(data, subtopic_id))
+        else:
+            ids_to_fetch.append(lid)
+
+    if not ids_to_fetch:
+        return results
+
+    # Batch call
+    batch_url = "https://api.semanticscholar.org/graph/v1/paper/batch"
+    headers = {"Content-Type": "application/json"}
+    if CONFIG.get("semantic_scholar_api_key"):
+        headers["x-api-key"] = CONFIG["semantic_scholar_api_key"]
+
+    try:
+        with _SS_LOCK:
+            resp = requests.post(
+                batch_url,
+                json={"ids": ids_to_fetch},
+                params={"fields": _SS_FIELDS},
+                headers=headers,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            time.sleep(1.0)
+        for lid, entry in zip(ids_to_fetch, resp.json()):
+            cache_k = _cache_key("ss_resolve", lid)
+            if entry and entry.get("title"):
+                _cache_set(conn, cache_k, json.dumps(entry))
+                results.append(_ss_paper_to_normalized(entry, subtopic_id))
+            else:
+                _cache_set(conn, cache_k, json.dumps({}))
+        log.debug(f"  SS Batch resolve: {len(results)} paper risolti")
+    except Exception as e:
+        log.warning(f"  SS Batch resolve fallito: {e}")
+        # Fallback: risoluzione seriale per i paper non ancora in cache
+        for lid in ids_to_fetch:
+            url = id_to_url.get(lid, "")
+            data = resolve_paper_ss(url)
+            if data and data.get("title"):
+                results.append(_ss_paper_to_normalized(data, subtopic_id))
+
+    return results
+
+
 # ─────────────────────────────────────────────
-# STEP 4 — MULTI-SOURCE RETRIEVAL PER SEZIONE
+# STEP 3 — MULTI-SOURCE RETRIEVAL PER SEZIONE
 # ─────────────────────────────────────────────
 
 def find_related_papers(
@@ -320,71 +305,97 @@ def find_related_papers(
     already_cited_urls: set[str],
 ) -> list[Paper]:
     """
-    Per ogni citazione della sezione:
-      (A) Risolve via SS API → ottiene SS paper ID → SS Recommendations
-      (B) Usa il titolo del paper come query su tutte le 4 sorgenti
+    Per ogni citazione della sezione (max N):
+      (A) Batch resolve via SS /paper/batch
+      (B) Per ogni paper risolto: SS Recommendations + SS References (se abilitato)
+      (C) Solo se il pool è ancora insufficiente: ricerca multi-source per titolo
 
     Restituisce il pool grezzo prima di scoring/filtro.
     """
     pool: list[Paper] = []
     title_queries: list[str] = []
 
-    # ── Fase A: risoluzione SS + raccomandazioni ─────────────────────────────
-    for citation in citations:
-        url = citation["url"]
-        ss_data = resolve_paper_ss(url)
-        if not ss_data or not ss_data.get("title"):
-            continue
+    max_cit = EXPANSION_CONFIG["max_citations_per_section"]
+    citations_subset = citations[:max_cit]
 
-        # Aggiungi il paper stesso come candidato (potrebbe avere più citazioni di quanto noto)
-        pool.append(_ss_paper_to_normalized(ss_data, subtopic_id="expansion"))
+    # ── Fase A: batch resolve via SS ─────────────────────────────────────────
+    resolved_papers = resolve_papers_ss_batch(
+        [c["url"] for c in citations_subset], subtopic_id="expansion"
+    )
+    pool.extend(resolved_papers)
 
-        # Raccolgo il titolo per la fase B (ricerca per titolo)
-        if ss_data.get("title"):
-            title_queries.append(ss_data["title"])
+    for ss_paper in resolved_papers:
+        if ss_paper.get("title"):
+            title_queries.append(ss_paper["title"])
 
-        # SS Recommendations dalla paper ID nativa
-        ss_id = ss_data.get("paperId") or ss_data.get("externalIds", {}).get("DOI")
-        if ss_id and not ss_id.startswith("DOI:"):
+        # Ricava SS paper ID dal URL per raccomandazioni + referenze
+        url = ss_paper.get("url", "")
+        ss_id = None
+        # Prova a trovare il paperId dal resolve cache
+        lookup_id = _build_ss_paper_lookup_id(url)
+        if lookup_id:
+            conn = _init_cache()
+            cache_k = _cache_key("ss_resolve", lookup_id)
+            cached = _cache_get(conn, cache_k, ttl_days=0)
+            if cached:
+                data = json.loads(cached)
+                ss_id = data.get("paperId")
+
+        if ss_id:
+            # SS Recommendations (paper correlati algoritmicamente)
             recs = get_ss_recommendations(ss_id)
             pool.extend(recs)
 
-    # Se non abbiamo risolto nulla, usa il titolo della sezione come query di fallback
+            # SS References (BIBLIOGRAFIA del paper — alta qualità semantica)
+            if EXPANSION_CONFIG.get("enable_references_fetch", True):
+                refs = fetch_ss_references_for_paper(ss_id)
+                pool.extend(refs)
+
+    # Fallback: se nessuna citazione è risolvibile, usa il titolo della sezione
     if not title_queries:
         title_queries = [section_title]
 
-    # ── Fase B: ricerca multi-sorgente per titolo ────────────────────────────
-    subtopic_id = "expansion"
-    tasks = []
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        for title_q in title_queries[:5]:  # Limita a 5 titoli per non sovraccaricare
-            queries = [title_q]
-            tasks.append(executor.submit(fetch_arxiv,            queries, subtopic_id))
-            tasks.append(executor.submit(fetch_pubmed,           queries, subtopic_id))
-            tasks.append(executor.submit(fetch_semantic_scholar, queries, subtopic_id))
-            tasks.append(executor.submit(fetch_openalex,         queries, subtopic_id))
-
-        for future in as_completed(tasks):
-            try:
-                pool.extend(future.result())
-            except Exception as e:
-                log.debug(f"  Task retrieval espansione fallito: {e}")
+    # ── Fase B: ricerca multi-source SOLO se pool insufficiente ─────────────
+    skip_threshold = EXPANSION_CONFIG["skip_multisource_threshold"]
+    if len(pool) < skip_threshold:
+        max_titles = EXPANSION_CONFIG["max_titles_for_search"]
+        subtopic_id = "expansion"
+        tasks = []
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            for title_q in title_queries[:max_titles]:
+                queries = [title_q]
+                tasks.append(executor.submit(fetch_arxiv,            queries, subtopic_id))
+                tasks.append(executor.submit(fetch_pubmed,           queries, subtopic_id))
+                tasks.append(executor.submit(fetch_semantic_scholar, queries, subtopic_id))
+                tasks.append(executor.submit(fetch_openalex,         queries, subtopic_id))
+            for future in as_completed(tasks):
+                try:
+                    pool.extend(future.result())
+                except Exception as e:
+                    log.debug(f"  Task retrieval espansione fallito: {e}")
+    else:
+        log.info(f"  Pool SS sufficiente ({len(pool)} candidati) — skip ricerca multi-source")
 
     # ── Deduplicazione e filtraggio già-citati ───────────────────────────────
     unique = deduplicate(pool)
     unique = filter_by_year(unique)
 
-    # Filtra paper già presenti nella sintesi originale (per URL normalizzato)
+    # Normalizza title+year come fingerprint aggiuntivo per dedup cross-sezione
+    def _title_year_fp(p: Paper) -> str:
+        title_key = "".join(c.lower() for c in p["title"] if c.isalnum())
+        return f"{title_key}_{p.get('year', '')}"
+
+    already_fps = {_title_year_fp({"title": u, "year": None}) for u in already_cited_urls}  # stub
+
     new_papers = [
         p for p in unique
         if p["url"].lower() not in already_cited_urls
-        and (p.get("doi", "") == "" or f"https://doi.org/{p['doi']}".lower() not in already_cited_urls)
+        and (not p.get("doi") or f"https://doi.org/{p['doi']}".lower() not in already_cited_urls)
         and bool(p["title"])
     ]
 
     log.info(
-        f"  [{section_title[:50]}] Pool grezzo: {len(pool)} | "
-        f"Unici nuovi: {len(new_papers)}"
+        f"  [{section_title[:50]}] Pool grezzo: {len(pool)} | Unici nuovi: {len(new_papers)}"
     )
     return new_papers
 
@@ -394,11 +405,14 @@ def find_related_papers(
 # ─────────────────────────────────────────────
 
 def select_top_papers(new_papers: list[Paper], section_title: str) -> list[Paper]:
-    """Esegue lo scoring usando il titolo della sezione come topic semantico e restituisce i top-K."""
+    """Scoring + MMR (se abilitato) per restituire i top-K paper più diversificati."""
     if not new_papers:
         return []
     scored = score_papers(new_papers, section_title)
     k = EXPANSION_CONFIG["top_k_per_section"]
+    if EXPANSION_CONFIG.get("enable_mmr", True) and len(scored) > k:
+        lambda_mmr = EXPANSION_CONFIG.get("mmr_lambda", 0.6)
+        return mmr_select(scored, k=k, lambda_mmr=lambda_mmr)
     return scored[:k]
 
 
@@ -428,51 +442,142 @@ IMPORTANTE:
 - NON avvolgere la risposta in blocchi di codice (```markdown```)."""
 
 
+EXPAND_DIFF_SYSTEM = """Sei un ricercatore accademico senior. Devi integrare nuovi paper in una sezione esistente.
+
+COMPITO: Scrivi SOLO i nuovi paragrafi da aggiungere (NON riscrivere il testo esistente).
+Per ogni nuovo paper, scrivi 1-3 frasi che lo integrino nel filo argomentativo della sezione.
+Ogni citazione nel formato [Autore et al., Anno](URL).
+
+Formato risposta:
+[INSERISCI_DOPO_PARAGRAFO_N]
+testo del nuovo paragrafo...
+
+[INSERISCI_DOPO_PARAGRAFO_N]
+testo del secondo nuovo paragrafo...
+
+IMPORTANTE:
+- Cita SOLO i paper nella lista. Non inventare riferimenti.
+- Indica il numero del paragrafo ESISTENTE dopo cui inserire il nuovo testo (contando da 1).
+- Se tutti i paper vanno alla fine, usa [INSERISCI_ALLA_FINE].
+- NON riscrivere o ripetere il testo originale."""
+
+
 def expand_section_content(
     client: OpenAI,
     section_title: str,
     original_content: str,
     new_papers: list[Paper],
 ) -> str:
-    """LLM espande la sezione originale integrando i nuovi paper."""
-    papers_block = json.dumps(
-        [
-            {
-                "id": i + 1,
-                "title": p["title"],
-                "authors": p["authors"][:3],
-                "year": p["year"],
-                "abstract": p["abstract"][:500],
-                "url": p["url"],
-                "citations": p["citations"],
-                "concepts": p.get("concepts", [])[:5],
-                "affiliations": p.get("affiliations", [])[:3],
-            }
-            for i, p in enumerate(new_papers)
-        ],
-        ensure_ascii=False,
-        indent=2,
-    )
+    """LLM espande la sezione originale integrando i nuovi paper.
+    Se diff_mode è abilitato, chiede solo i nuovi paragrafi (meno token output).
+    """
+    if EXPANSION_CONFIG.get("diff_mode", False):
+        return _expand_section_diff(client, section_title, original_content, new_papers)
+    return _expand_section_full(client, section_title, original_content, new_papers)
 
+
+def _expand_section_full(
+    client: OpenAI,
+    section_title: str,
+    original_content: str,
+    new_papers: list[Paper],
+) -> str:
+    """Modalità standard: riscrive la sezione completa con i nuovi paper integrati."""
+    abs_chars = EXPANSION_CONFIG["abstract_chars_expand"]
+    papers_block = json.dumps(
+        [{"id": i + 1, "title": p["title"], "authors": p["authors"][:3],
+          "year": p["year"], "abstract": p["abstract"][:abs_chars],
+          "url": p["url"], "citations": p["citations"]}
+         for i, p in enumerate(new_papers)],
+        ensure_ascii=False,
+    )
     prompt = (
         f"SEZIONE: {section_title}\n\n"
         f"TESTO ORIGINALE:\n{original_content}\n\n"
-        f"NUOVI PAPER DA INTEGRARE:\n{papers_block}\n\n"
+        f"NUOVI PAPER:\n{papers_block}\n\n"
         "Espandi la sezione integrando i nuovi paper."
     )
-
-    response = client.chat.completions.create(
-        model=CONFIG["model"],
-        temperature=CONFIG["temperature"],
-        max_tokens=EXPANSION_CONFIG["max_tokens_expand"],
-        messages=[
-            {"role": "system", "content": EXPAND_SYSTEM},
-            {"role": "user", "content": prompt},
-        ],
-    )
-    raw = response.choices[0].message.content
-    # Rimozione deterministica di heading iniziali e code fences residui
+    raw = llm_chat(client, system=EXPAND_SYSTEM, user=prompt,
+                   max_tokens=EXPANSION_CONFIG["max_tokens_expand"])
     return _strip_leading_heading(_strip_code_fences(raw))
+
+
+def _expand_section_diff(
+    client: OpenAI,
+    section_title: str,
+    original_content: str,
+    new_papers: list[Paper],
+) -> str:
+    """Modalità diff: chiede solo i nuovi paragrafi da inserire, poi li applica al testo originale.
+    Risparmia ~50% token di output rispetto alla riscrittura completa.
+    """
+    abs_chars = EXPANSION_CONFIG["abstract_chars_expand"]
+    papers_block = json.dumps(
+        [{"id": i + 1, "title": p["title"], "authors": p["authors"][:3],
+          "year": p["year"], "abstract": p["abstract"][:abs_chars],
+          "url": p["url"], "citations": p["citations"]}
+         for i, p in enumerate(new_papers)],
+        ensure_ascii=False,
+    )
+    # Numerazione paragrafi nel testo originale
+    paragraphs = [p.strip() for p in original_content.split("\n\n") if p.strip()]
+    numbered_content = "\n\n".join(
+        f"[P{i+1}] {p}" for i, p in enumerate(paragraphs)
+    )
+    prompt = (
+        f"SEZIONE: {section_title}\n\n"
+        f"TESTO ESISTENTE (paragrafi numerati):\n{numbered_content}\n\n"
+        f"NUOVI PAPER DA INTEGRARE:\n{papers_block}\n\n"
+        "Scrivi SOLO i nuovi paragrafi da aggiungere."
+    )
+    raw = llm_chat(client, system=EXPAND_DIFF_SYSTEM, user=prompt,
+                   max_tokens=EXPANSION_CONFIG["max_tokens_expand"] // 2)
+    # Applica il diff al testo originale
+    return _apply_diff_to_content(original_content, raw)
+
+
+def _apply_diff_to_content(original: str, diff_response: str) -> str:
+    """Applica i nuovi paragrafi generati in modalità diff al testo originale."""
+    paragraphs = [p.strip() for p in original.split("\n\n") if p.strip()]
+
+    # Parsa le istruzioni [INSERISCI_DOPO_PARAGRAFO_N] e [INSERISCI_ALLA_FINE]
+    insertions: dict[int, list[str]] = {}  # para_index → [new_paras]
+    current_key: Optional[int] = None
+    current_text: list[str] = []
+
+    for line in diff_response.split("\n"):
+        m_after = re.match(r'\[INSERISCI_DOPO_PARAGRAFO_(\d+)\]', line.strip(), re.IGNORECASE)
+        m_end = re.match(r'\[INSERISCI_ALLA_FINE\]', line.strip(), re.IGNORECASE)
+        if m_after or m_end:
+            if current_key is not None and current_text:
+                insertions.setdefault(current_key, []).append("\n".join(current_text).strip())
+            current_key = int(m_after.group(1)) if m_after else len(paragraphs)
+            current_text = []
+        elif current_key is not None:
+            current_text.append(line)
+
+    if current_key is not None and current_text:
+        insertions.setdefault(current_key, []).append("\n".join(current_text).strip())
+
+    if not insertions:
+        # Se il modello non ha seguito il formato, appendiamo il diff alla fine
+        clean = _strip_leading_heading(_strip_code_fences(diff_response))
+        return original + "\n\n" + clean
+
+    # Ricostruisce il testo inserendo i nuovi paragrafi nelle posizioni giuste
+    result: list[str] = []
+    for i, para in enumerate(paragraphs):
+        result.append(para)
+        idx = i + 1  # 1-based
+        for new_para in insertions.get(idx, []):
+            if new_para:
+                result.append(new_para)
+    # Paragrafi "alla fine"
+    for new_para in insertions.get(len(paragraphs), []):
+        if new_para:
+            result.append(new_para)
+
+    return "\n\n".join(result)
 
 
 # ─────────────────────────────────────────────
@@ -505,7 +610,11 @@ def save_expansion_run(
             break
 
     parts = ["\n".join(header_lines).strip(), ""]
-    parts.append(f"*Espansa: {datetime.now().strftime('%Y-%m-%d %H:%M')}*\n")
+    parts.append(f"*Espansa: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*\n")
+    parts.append("> **Metadati espansione**\n>")
+    for line in LLM_STATS.summary_md(CONFIG["model"]).split("\n"):
+        parts.append(f"> {line}")
+    parts.append(f"> - **Sezioni espanse**: {sum(1 for s in expanded_sections if s.get('expanded_content'))}\n")
 
     for sec in expanded_sections:
         parts.append(f"## {sec['title']}\n")
@@ -519,6 +628,14 @@ def save_expansion_run(
     # Trace JSONL
     trace_path = out_dir / "expansion_trace.jsonl"
     with trace_path.open("w", encoding="utf-8") as f:
+        # Prima riga: metadati run
+        f.write(json.dumps({
+            "type": "run_metadata",
+            "timestamp": datetime.utcnow().isoformat(),
+            "model": CONFIG["model"],
+            "expansion_config": EXPANSION_CONFIG,
+            "llm_stats": LLM_STATS.to_dict(),
+        }, ensure_ascii=False) + "\n")
         for entry in trace:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
@@ -542,6 +659,7 @@ def run_expansion_pipeline(synthesis_path: Path, top_k: int = 5) -> Path:
     log.info("AVVIO EXPANSION PIPELINE")
     log.info(f"Input: {synthesis_path}")
     log.info("=" * 60)
+    LLM_STATS.start_run()
 
     if not synthesis_path.exists():
         raise FileNotFoundError(f"File non trovato: {synthesis_path}")
@@ -611,14 +729,28 @@ def run_expansion_pipeline(synthesis_path: Path, top_k: int = 5) -> Path:
             client, section["title"], section["content"], top_papers
         )
 
-        # ── Fase 7: self-reflection ──────────────────────────────────────────
-        log.info("STEP 7 — Self-reflection...")
-        all_papers_for_reflect = top_papers  # include solo i nuovi per la validazione citazioni
-        raw_reflection = reflect_on_section(
-            client, section["title"], expanded_draft, all_papers_for_reflect
-        )
-        # Strip deterministico: reflect_on_section può aggiungere heading iniziali
-        expanded_final = _strip_leading_heading(_strip_code_fences(raw_reflection))
+        # ── Fase 7: self-reflection (opzionale) ──────────────────────────────
+        if EXPANSION_CONFIG.get("enable_reflection", False):
+            log.info("STEP 7 — Self-reflection...")
+            # Per la reflection: passa SIA i paper originali (estratti dalle citazioni
+            # pre-esistenti) SIA i nuovi, altrimenti il revisore potrebbe rimuovere
+            # citazioni valide pensandole inventate.
+            original_citation_papers = [
+                {
+                    "title": c["display_text"],
+                    "authors": [c["display_text"].split(" et al.")[0]] if "et al." in c["display_text"] else [],
+                    "year": "",
+                    "url": c["url"],
+                }
+                for c in citations
+            ]
+            all_papers_for_reflect = list(top_papers) + original_citation_papers
+            raw_reflection = reflect_on_section(
+                client, section["title"], expanded_draft, all_papers_for_reflect
+            )
+            expanded_final = _strip_leading_heading(_strip_code_fences(raw_reflection))
+        else:
+            expanded_final = expanded_draft
 
         # Aggiorna gli URL già citati per le sezioni successive
         new_urls = {c["url"].lower() for c in extract_citations(expanded_final)}
@@ -657,6 +789,8 @@ def run_expansion_pipeline(synthesis_path: Path, top_k: int = 5) -> Path:
     expanded_count = sum(1 for e in trace if e.get("expanded"))
     log.info(f"  Sezioni espanse: {expanded_count}/{len(sections)}")
     log.info(f"  Nuovi paper integrati: {total_new}")
+    log.info(f"  LLM: {LLM_STATS.calls} chiamate, {LLM_STATS.total_tokens:,} token, {LLM_STATS.total_seconds:.1f}s")
+    log.info(f"  Tempo totale: {LLM_STATS.wall_seconds:.1f}s")
     log.info("=" * 60)
     log.info(f"EXPANSION COMPLETATA — Output: {output_path}")
     log.info("=" * 60)
@@ -691,7 +825,27 @@ if __name__ == "__main__":
         default=5,
         help="Numero massimo di nuovi paper da integrare per sezione (default: 5)",
     )
+    parser.add_argument(
+        "--reflect",
+        action="store_true",
+        help="Abilita self-reflection LLM su ogni sezione (raddoppia le chiamate al modello).",
+    )
+    parser.add_argument(
+        "--diff",
+        action="store_true",
+        help="Modalità diff: genera solo i nuovi paragrafi (risparmio ~50% token output).",
+    )
+    parser.add_argument(
+        "--no-references",
+        action="store_true",
+        help="Disabilita il fetch delle referenze SS (usa solo raccomandazioni).",
+    )
     args = parser.parse_args()
+
+    EXPANSION_CONFIG["enable_reflection"] = args.reflect
+    EXPANSION_CONFIG["diff_mode"] = args.diff
+    if args.no_references:
+        EXPANSION_CONFIG["enable_references_fetch"] = False
 
     output = run_expansion_pipeline(args.synthesis, top_k=args.top_k)
     print(f"\n✓ Sintesi espansa generata: {output}")
