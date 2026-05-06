@@ -29,6 +29,8 @@ class Config(BaseModel):
     mirror_paths: bool = False
     print_css: Optional[str] = None
     dry_run: bool = False
+    skip_nav_elements: bool = False
+    nav_elements: list[str] = Field(default_factory=lambda: ["header", "footer", "nav"])
     skip_404: bool = True
     not_found_patterns: list[str] = Field(
         default_factory=lambda: [

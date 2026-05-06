@@ -36,6 +36,17 @@ def _add_crawl_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--print-css", type=str, default=None, help="Extra CSS for @media print")
     p.add_argument("--dry-run", action="store_true", help="Discover URLs without saving PDFs")
     p.add_argument("--config", type=Path, default=None, help="Load config from YAML/JSON file")
+    p.add_argument(
+        "--skip-nav",
+        action="store_true",
+        help="Skip links found inside <header>, <footer>, <nav> elements (default: off).",
+    )
+    p.add_argument(
+        "--nav-elements",
+        type=str,
+        default=None,
+        help="Comma-separated HTML tags to exclude from link extraction (default: header,footer,nav).",
+    )
 
 
 def _build_config_from_args(args: argparse.Namespace) -> Config:
@@ -71,6 +82,11 @@ def _build_config_from_args(args: argparse.Namespace) -> Config:
         mirror_paths=overrides.get("mirror_paths", args.mirror_paths),
         print_css=overrides.get("print_css", args.print_css),
         dry_run=overrides.get("dry_run", args.dry_run),
+        skip_nav_elements=overrides.get("skip_nav_elements", args.skip_nav),
+        nav_elements=overrides.get(
+            "nav_elements",
+            [t.strip() for t in args.nav_elements.split(",")] if args.nav_elements else ["header", "footer", "nav"],
+        ),
     )
 
 

@@ -209,7 +209,8 @@ class Crawler:
                 if depth < self.cfg.depth:
                     try:
                         html = await renderer.get_html(page)
-                        links = extract_links(html, url)
+                        skip_els = self.cfg.nav_elements if self.cfg.skip_nav_elements else None
+                        links = extract_links(html, url, skip_elements=skip_els)
                         enqueued = 0
                         for link in links:
                             key = canonical_key(link)
@@ -260,7 +261,8 @@ class Crawler:
                 try:
                     await renderer.navigate(page, url)
                     html = await renderer.get_html(page)
-                    for link in extract_links(html, url):
+                    skip_els = self.cfg.nav_elements if self.cfg.skip_nav_elements else None
+                    for link in extract_links(html, url, skip_elements=skip_els):
                         key = canonical_key(link)
                         if key in self.visited:
                             continue

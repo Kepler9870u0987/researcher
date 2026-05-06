@@ -146,16 +146,32 @@ def url_to_mirror_path(url: str) -> str:
     return path
 
 
-def extract_links(html: str, base_url: str, max_links: int = 200) -> list[str]:
-    """Extract and resolve links from HTML content."""
+def extract_links(
+    html: str,
+    base_url: str,
+    max_links: int = 200,
+    skip_elements: list[str] | None = None,
+) -> list[str]:
+    """Extract and resolve links from HTML content.
+
+    Args:
+        skip_elements: HTML tag names whose subtrees are excluded from link
+                       extraction (e.g. ['header', 'footer', 'nav']).
+    """
     soup = BeautifulSoup(html, "html.parser")
-    out: list[str] = []
 
     # Resolve <base href> if present
     base_tag = soup.find("base", href=True)
     if base_tag:
         base_url = urljoin(base_url, base_tag["href"])
 
+    # Remove excluded subtrees in-place before scanning links
+    if skip_elements:
+        for tag_name in skip_elements:
+            for el in soup.find_all(tag_name):
+                el.decompose()
+
+    out: list[str] = []
     for tag in soup.find_all(["a", "area"], href=True):
         if len(out) >= max_links:
             break
